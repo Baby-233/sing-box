@@ -2256,8 +2256,8 @@ function generate_tls_config() {
 # 配置 ECH
 function set_ech_config() {
     while true; do
-        read -p "是否开启 ECH?(Y/N，默认Y):" enable_ech
-        enable_ech="${enable_ech:-Y}"
+        read -p "是否开启 ECH?(Y/N，默认N):" enable_ech
+        enable_ech="${enable_ech:-N}"
 
         if [[ "$enable_ech" == "y" || "$enable_ech" == "Y" ]]; then
             get_ech_keys
@@ -4177,11 +4177,14 @@ function delete_choice() {
     local temp_json="/usr/local/etc/sing-box/temp.json"
     local temp_yaml="/usr/local/etc/sing-box/temp.yaml"
 
+    # 提取节点类型和标签
     extract_types_tags
     valid_choice=false
 
+   # 验证用户选择的节点
     while [ "$valid_choice" == false ]; do
         read -p "请选择要删除的节点配置（输入对应的数字）: " choice
+        echo "你选择了: $choice"
         if [[ ! $choice =~ ^[0-9]+$ || $choice -lt 1 || $choice -gt ${#types[@]} ]]; then
             echo -e "${RED}错误：无效的选择，请重新输入！${NC}"
         else
@@ -4191,9 +4194,12 @@ function delete_choice() {
 
     selected_tag="${filtered_tags[$choice-1]}"
     selected_type="${types[$choice-1]}"
+
+    # 提取监听端口
     listen_port=$(jq -r --arg selected_tag "$selected_tag" '.inbounds[] | select(.tag == $selected_tag) | .listen_port' "$config_file" | awk '{print int($0)}')
 
     if [ "$selected_type" == "wireguard" ]; then
+        # 删除 Wireguard 相关配置
         jq '.outbounds |= map(select(.tag != "warp-IPv4-out" and .tag != "warp-IPv6-out" and .tag != "wireguard-out"))' "$config_file" > "$temp_json"
         mv "$temp_json" "$config_file"
         jq '.route.rules |= map(select(.outbound != "warp-IPv4-out" and .outbound != "warp-IPv6-out"))' "$config_file" > "$temp_json"
@@ -4201,6 +4207,7 @@ function delete_choice() {
         jq 'del(.route.rule_set)' "$config_file" > "$temp_json"
         mv "$temp_json" "$config_file"
     else
+        # 删除非 Wireguard 配置
         detour_tag=$(jq -r --arg selected_tag "$selected_tag" '.inbounds[] | select(.type == "shadowtls" and .tag == $selected_tag) | .detour' "$config_file")
         jq --arg selected_tag "$selected_tag" --arg detour_tag "$detour_tag" '.inbounds |= map(select(.tag != $selected_tag and .tag != $detour_tag))' "$config_file" > "$temp_json"
         mv "$temp_json" "$config_file"
@@ -4208,6 +4215,7 @@ function delete_choice() {
         mv "$temp_json" "$config_file"
     fi
 
+    # 删除 output_file 中与端口相关的条目
     if [ "$selected_type" != "wireguard" ]; then
         awk -v port="$listen_port" '$0 ~ "监听端口: " port {print; in_block=1; next} in_block && NF == 0 {in_block=0} !in_block' "$output_file" > "$output_file.tmp1"
         mv "$output_file.tmp1" "$output_file"
@@ -4216,64 +4224,92 @@ function delete_choice() {
         sed -i '/./,$!d' "$output_file"
     fi
 
+    # 处理 Clash YAML 文件中的匹配项
     if [ -f "$clash_yaml" ]; then
-    get_clash_tags=$(awk '/proxies:/ {in_proxies_block=1} in_proxies_block && /- name:/ {name = $3} in_proxies_block && /port:/ {port = $2; print "Name:", name, "Port:", port}' "$clash_yaml" > "$temp_yaml")
-    matching_clash_tag=$(grep "Port: $listen_port" "$temp_yaml" | awk '{print $2}')
+        get_clash_tags=$(awk '/proxies:/ {in_proxies_block=1} in_proxies_block && /- name:/ {name = $3} in_proxies_block && /port:/ {port = $2; print "Name:", name, "Port:", port}' "$clash_yaml" > "$temp_yaml")
+        matching_clash_tag=$(grep "Port: $listen_port" "$temp_yaml" | awk '{print $2}')
     fi
 
+    # 提取匹配的标签值
     if [ -n "$listen_port" ]; then
-        phone_matching_tag=$(jq -r --argjson listen_port "$listen_port" '.outbounds[] | select(.server_port == $listen_port) | .tag' "$phone_client_file")
-        win_matching_tag=$(jq -r --argjson listen_port "$listen_port" '.outbounds[] | select(.server_port == $listen_port) | .tag' "$win_client_file")
+        # 提取 phone_client_file 中所有匹配的标签
+        phone_matching_tags=$(jq -r --argjson listen_port "$listen_port" '.outbounds[] | select(.server_port == $listen_port) | .tag' "$phone_client_file")
+        # 提取 win_client_file 中所有匹配的标签
+        win_matching_tags=$(jq -r --argjson listen_port "$listen_port" '.outbounds[] | select(.server_port == $listen_port) | .tag' "$win_client_file")
     fi
 
-    jq --arg tag "$phone_matching_tag" '.outbounds |= map(select(.tag != $tag))' "$phone_client_file" > "$temp_json"
-    mv "$temp_json" "$phone_client_file"
-    jq --arg tag "$win_matching_tag" '.outbounds |= map(select(.tag != $tag))' "$win_client_file" > "$temp_json"
-    mv "$temp_json" "$win_client_file"
+    # 处理 phone_matching_tags
+    echo "$phone_matching_tags" | while read -r phone_tag; do
+        if [ -n "$phone_tag" ]; then
+            jq --arg tag "$phone_tag" '.outbounds |= map(select(.tag != $tag))' "$phone_client_file" > "$temp_json"
+            mv "$temp_json" "$phone_client_file"
 
+            phone_matching_detour=$(jq -r --arg tag "$phone_tag" '.outbounds[] | select(.detour == $tag) | .detour' "$phone_client_file")
+            phone_matching_detour_tag=$(jq -r --arg detour "$phone_matching_detour" '.outbounds[] | select(.detour == $detour) | .tag' "$phone_client_file")
+
+            # 删除 outbounds 中的条目
+            awk -v tag="$phone_tag" '!/^      "outbounds": \[$/,/^\s*]/{if (!($0 ~ "^ * \"" tag "\"")) print; else next; }' "$phone_client_file" > "$phone_client_file.tmp"
+            mv "$phone_client_file.tmp" "$phone_client_file"
+
+            if [ "$phone_tag" == "$phone_matching_detour" ]; then
+                jq --arg detour "$phone_matching_detour" '.outbounds |= map(select(.detour != $detour))' "$phone_client_file" > "$temp_json"
+                mv "$temp_json" "$phone_client_file"
+                awk -v phone_matching_detour_tag="$phone_matching_detour_tag" '!/^      "outbounds": \[$/,/^\s*]/{if (!($0 ~ "^ * \"" phone_matching_detour_tag "\"")) print; else next; }' "$phone_client_file" > "$phone_client_file.tmp"
+                mv "$phone_client_file.tmp" "$phone_client_file"
+            fi
+        fi
+    done
+
+    # 处理 win_matching_tags
+    echo "$win_matching_tags" | while read -r win_tag; do
+        if [ -n "$win_tag" ]; then
+            jq --arg tag "$win_tag" '.outbounds |= map(select(.tag != $tag))' "$win_client_file" > "$temp_json"
+            mv "$temp_json" "$win_client_file"
+
+            win_matching_detour=$(jq -r --arg tag "$win_tag" '.outbounds[] | select(.detour == $tag) | .detour' "$win_client_file")
+            win_matching_detour_tag=$(jq -r --arg detour "$win_matching_detour" '.outbounds[] | select(.detour == $detour) | .tag' "$win_client_file")
+
+            # 删除 outbounds 中的条目
+            awk -v tag="$win_tag" '!/^      "outbounds": \[$/,/^\s*]/{if (!($0 ~ "^ * \"" tag "\"")) print; else next; }' "$win_client_file" > "$win_client_file.tmp"
+            mv "$win_client_file.tmp" "$win_client_file"
+
+            if [ "$win_tag" == "$win_matching_detour" ]; then
+                jq --arg detour "$win_matching_detour" '.outbounds |= map(select(.detour != $detour))' "$win_client_file" > "$temp_json"
+                mv "$temp_json" "$win_client_file"
+                awk -v win_matching_detour_tag="$win_matching_detour_tag" '!/^      "outbounds": \[$/,/^\s*]/{if (!($0 ~ "^ * \"" win_matching_detour_tag "\"")) print; else next; }' "$win_client_file" > "$win_client_file.tmp"
+                mv "$win_client_file.tmp" "$win_client_file"
+            fi
+        fi
+    done
+
+    # 删除 Clash YAML 文件中的标签
     if [ -n "$matching_clash_tag" ] && [ "$selected_type" != "wireguard" ]; then
-      sed -i "/^  - name: $matching_clash_tag$/,/^\s*$/d" "$clash_yaml"
-      sed -i "/proxy-groups:/,/^\s*$/ {/      - $matching_clash_tag/d}" "$clash_yaml"
+        echo "$matching_clash_tag" | while read -r tag; do
+            if [ -n "$tag" ]; then
+                escaped_tag=$(printf '%q' "$tag")
+                sed -i "/^  - name: $escaped_tag$/,/^\s*$/d" "$clash_yaml"
+                sed -i "/proxy-groups:/,/^\s*$/ {/      - $escaped_tag/d}" "$clash_yaml"
+            fi
+        done
     fi
 
-    phone_matching_detour=$(jq -r --arg phone_matching_tag "$phone_matching_tag" '.outbounds[] | select(.detour == $phone_matching_tag) | .detour' "$phone_client_file")
-    win_matching_detour=$(jq -r --arg win_matching_tag "$win_matching_tag" '.outbounds[] | select(.detour == $win_matching_tag) | .detour' "$win_client_file")
-    phone_matching_detour_tag=$(jq -r --arg phone_matching_detour "$phone_matching_detour" '.outbounds[] | select(.detour == $phone_matching_detour) | .tag' "$phone_client_file")
-    win_matching_detour_tag=$(jq -r --arg win_matching_detour "$win_matching_detour" '.outbounds[] | select(.detour == $win_matching_detour) | .tag' "$win_client_file")
-
-    awk -v phone_matching_tag="$phone_matching_tag" '!/^      "outbounds": \[$/,/^\s*]/{if (!($0 ~ "^ * \"" phone_matching_tag "\"")) print; else next; }' "$phone_client_file" > "$phone_client_file.tmp"
-    mv "$phone_client_file.tmp" "$phone_client_file"
-    awk -v win_matching_tag="$win_matching_tag" '!/^      "outbounds": \[$/,/^\s*]/{if (!($0 ~ "^ * \"" win_matching_tag "\"")) print; else next; }' "$win_client_file" > "$win_client_file.tmp"
-    mv "$win_client_file.tmp" "$win_client_file"
-
-    if [ "$phone_matching_tag" == "$phone_matching_detour" ]; then
-        jq --arg phone_matching_detour "$phone_matching_detour" '.outbounds |= map(select(.detour != $phone_matching_detour))' "$phone_client_file" > "$temp_json"
-        mv "$temp_json" "$phone_client_file"
-        awk -v phone_matching_detour_tag="$phone_matching_detour_tag" '!/^      "outbounds": \[$/,/^\s*]/{if (!($0 ~ "^ * \"" phone_matching_detour_tag "\"")) print; else next; }' "$phone_client_file" > "$phone_client_file.tmp"
-        mv "$phone_client_file.tmp" "$phone_client_file"
-    fi
-
-    if [ "$win_matching_tag" == "$win_matching_detour" ]; then
-        jq --arg win_matching_detour "$win_matching_detour" '.outbounds |= map(select(.detour != $win_matching_detour))' "$win_client_file" > "$temp_json"
-        mv "$temp_json" "$win_client_file"
-        awk -v win_matching_detour_tag="$win_matching_detour_tag" '!/^      "outbounds": \[$/,/^\s*]/{if (!($0 ~ "^ * \"" win_matching_detour_tag "\"")) print; else next; }' "$win_client_file" > "$win_client_file.tmp"
-        mv "$win_client_file.tmp" "$win_client_file"
-    fi
-
+    # 清理 JSON 文件的尾逗号
     awk '{if ($0 ~ /],$/ && p ~ /,$/) sub(/,$/, "", p); if (NR > 1) print p; p = $0;}END{print p;}' "$phone_client_file" > "$phone_client_file.tmp"
     mv "$phone_client_file.tmp" "$phone_client_file"
     awk '{if ($0 ~ /],$/ && p ~ /,$/) sub(/,$/, "", p); if (NR > 1) print p; p = $0;}END{print p;}' "$win_client_file" > "$win_client_file.tmp"
     mv "$win_client_file.tmp" "$win_client_file"
 
+    # 删除临时文件
     [ -f "$temp_yaml" ] && rm "$temp_yaml"
 
+    # 检查配置文件中的某些字段是否需要处理
     if ! jq -e 'select(.inbounds[] | .listen == "::")' "$config_file" > /dev/null; then
         sed -i 's/"rules": \[\]/"rules": [\n    ]/' "$config_file"
         sed -i 's/^  "inbounds": \[\],/  "inbounds": [\n  ],/' "$config_file"
         sed -i 's/^      "outbounds": \[\],/      "outbounds": [\n      ],/' "$win_client_file"
         sed -i 's/^      "outbounds": \[\],/      "outbounds": [\n      ],/' "$phone_client_file"
     fi
-    
+
     update_client_file
     systemctl restart sing-box
     echo "已删除 $selected_type 的配置信息，服务端及客户端配置信息已更新，请下载新的配置文件使用！"
